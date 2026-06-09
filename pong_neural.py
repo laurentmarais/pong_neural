@@ -27,6 +27,7 @@ Requires: pygame, numpy, matplotlib
 
 import os
 import sys
+import copy
 import pickle
 import random
 
@@ -88,6 +89,13 @@ FPS = 60
 PADDLE_WIDTH = 12
 PADDLE_HEIGHT = 100
 PADDLE_SPEED = 6
+# Wrap paddles vertically (off the top -> back on the bottom). Removes the walls
+# a collapsed policy gets pinned against, so the paddle can never get stuck.
+# NOTE: tested and it HURTS learning a lot (best-seen frozen ~0.61 -> ~0.24),
+# because the ball lives in a bounded box but a wrapped paddle lives on a loop,
+# and that geometry mismatch is hard to learn (circular sin/cos encoding doesn't
+# rescue it either). Left as an opt-in gameplay toggle but defaulted OFF.
+WRAP_PADDLES = False
 
 BALL_SIZE = 10
 BALL_BASE_SPEED = 5.0
@@ -100,6 +108,14 @@ LEARNING_RATE = 0.01         # policy-gradient (REINFORCE) step size
 REWARD_HIT = 1.0
 REWARD_MISS = -10.0
 REWARD_DISCOUNT = 0.9        # credit decays into the past from a hit/miss event
+
+# Reward baseline (variance reduction): learn from how much better/worse than
+# usual an outcome was (advantage = reward - running average) instead of the raw
+# +1/-10. This is the standard REINFORCE fix — it stops the big -10 penalty from
+# violently collapsing the policy, so accuracy climbs and *holds* instead of
+# spiking then forgetting.
+REWARD_BASELINE = True
+BASELINE_LR = 0.02           # EMA rate of the running-average baseline
 
 # Imitation pre-training (DISABLED): when on, each frame supervises a Training
 # brain toward the analytically-correct move — fast but spoon-fed. Left here so
@@ -116,6 +132,16 @@ IMITATION_DECAY = 0.85       # multiply IMITATION_LR by this every generation
 # a rally to end. Keep the scale small so the true +1/-10 outcomes still dominate.
 REWARD_SHAPING = True
 SHAPING_SCALE = 0.3          # per-frame shaping reward magnitude (try 0.1-0.5)
+SHAPING_STEP = 0.01          # increment for adjusting wheels in the menu / in-game
+
+# Keep-the-best checkpointing: RL training peaks then often collapses (the paddle
+# drifts into a corner). Periodically score the brain's TRUE frozen skill against
+# the Perfect bot and remember the best weights seen, so saving (S) captures the
+# peak instead of a post-collapse policy. Press R in-game to snap the live brain
+# back to its best.
+KEEP_BEST = True
+CHECKPOINT_EVERY = 600       # game frames between frozen evaluations (~10s @ 60fps)
+CHECKPOINT_FRAMES = 1200     # frames per frozen benchmark rollout
 
 # Colors
 BLACK = (10, 10, 15)
@@ -154,6 +180,8 @@ class NeuralBrain:
 
         # Trajectory buffer of per-frame gradients awaiting a reward signal.
         self._pending = []
+        # Running-average reward baseline for variance reduction (REINFORCE).
+        self._baseline = 0.0
 
     # --- inference -------------------------------------------------------
     def _forward(self, x):
@@ -206,7 +234,14 @@ class NeuralBrain:
         punishing an entire rally flat — the latter collapses the policy."""
         if not self._pending:
             return
-        scale0 = LEARNING_RATE * value
+        if REWARD_BASELINE:
+            # advantage = how much better/worse than our running average, then
+            # nudge the baseline toward this outcome.
+            advantage = value - self._baseline
+            self._baseline += BASELINE_LR * (value - self._baseline)
+        else:
+            advantage = value
+        scale0 = LEARNING_RATE * advantage
         g = 1.0
         for dW1, db1, dW2, db2 in reversed(self._pending):
             s = scale0 * g
@@ -315,11 +350,10 @@ def teacher_action(ball, paddle, target_x):
     """The analytically-correct move (0=up, 1=stay, 2=down) for `paddle`: aim
     its center at the ball's predicted intercept. This is the lesson imitation
     learning supervises against."""
-    target = predicted_intercept_y(ball, target_x)
-    center = paddle.y + PADDLE_HEIGHT / 2
-    if target < center - PADDLE_SPEED:
+    diff = _wrapped_dy(predicted_intercept_y(ball, target_x), paddle.center)
+    if diff < -PADDLE_SPEED:
         return 0
-    if target > center + PADDLE_SPEED:
+    if diff > PADDLE_SPEED:
         return 2
     return 1
 
@@ -373,18 +407,57 @@ class AIController:
 
     kind = "AI"
 
-    def __init__(self, side, brain, learning, save_path, source_name="(new)"):
+    def __init__(self, side, brain, learning, save_path, source_name="(new)",
+                 shape_scale=SHAPING_SCALE):
         self.side = side
         self.brain = brain
         self.learning = learning
         self.save_path = save_path
         self.source_name = source_name        # what was loaded, for display
         self.imit_lr = IMITATION_LR            # decays each generation (imitation only)
+        # "Training wheels": dense shaping strength. Higher = the paddle is
+        # steered toward the correct move more each frame (learns fast but leans
+        # on the live correction). Lower it toward 0 as the brain improves so the
+        # static policy must stand on its own — that's what makes a FROZEN brain
+        # good. 0 = pure sparse RL, no training wheels.
+        self.shape_scale = shape_scale
+        # keep-the-best checkpointing state
+        self.best_brain = None
+        self.best_score = -1.0
 
     def set_learning(self, on):
         self.learning = on
         if not on:
             self.brain._pending.clear()        # drop any half-finished trajectory
+
+    def checkpoint(self):
+        """Score the current weights' true frozen skill; keep a copy if it's the
+        best so far. Returns the score."""
+        score = frozen_score(self.brain, self.side)
+        if self.best_brain is None or score > self.best_score:
+            self.best_score = score
+            self.best_brain = copy.deepcopy(self.brain)
+        return score
+
+    def restore_best(self):
+        """Snap the live brain back to its best-seen weights (undo a collapse)."""
+        if self.best_brain is None:
+            return False
+        b = self.best_brain
+        self.brain.W1, self.brain.b1 = b.W1.copy(), b.b1.copy()
+        self.brain.W2, self.brain.b2 = b.W2.copy(), b.b2.copy()
+        self.brain._pending.clear()
+        return True
+
+    def brain_to_save(self):
+        """The brain S should write: the best-seen one when checkpointing, else
+        whatever is current."""
+        if KEEP_BEST and self.best_brain is not None:
+            return self.best_brain
+        return self.brain
+
+    def adjust_shape(self, delta):
+        self.shape_scale = round(min(0.6, max(0.0, self.shape_scale + delta)), 2)
 
     def decide(self, ball, paddle):
         x = encode_state(ball, paddle.y, self.side)
@@ -395,21 +468,22 @@ class AIController:
             if IMITATION and self.imit_lr > 1e-4:
                 # imitation: supervise toward the correct move for THIS paddle.
                 self.brain.learn_supervised(x, teacher_action(ball, paddle, front_x), self.imit_lr)
-            if REWARD_SHAPING:
-                # dense RL reward: did the sampled action move toward the intercept?
+            if self.shape_scale > 0:
+                # dense RL reward ("training wheels"): did the sampled action
+                # move toward the intercept (the shorter way around if wrapping)?
                 target = predicted_intercept_y(ball, front_x)
-                center = paddle.y + PADDLE_HEIGHT / 2
+                diff = _wrapped_dy(target, paddle.center)
                 chosen = action - 1                          # -1 up / 0 stay / +1 down
                 desired = 0
-                if target < center - PADDLE_SPEED:
+                if diff < -PADDLE_SPEED:
                     desired = -1
-                elif target > center + PADDLE_SPEED:
+                elif diff > PADDLE_SPEED:
                     desired = 1
                 if desired == 0:
                     agreement = 1.0 if chosen == 0 else -0.5  # reward holding still when aligned
                 else:
                     agreement = 1.0 if chosen == desired else (-1.0 if chosen == -desired else 0.0)
-                self.brain.reward_last(SHAPING_SCALE * agreement)
+                self.brain.reward_last(self.shape_scale * agreement)
         return action - 1            # 0/1/2 -> -1/0/1
 
     def decay_imitation(self):
@@ -446,7 +520,8 @@ def build_from_config(side, cfg):
             source_name = "(new)"
             print(f"[{side}] Fresh random brain (learning={'on' if cfg['learning'] else 'off'}).")
         return AIController(side, brain, learning=cfg["learning"],
-                            save_path=cfg["save"], source_name=source_name)
+                            save_path=cfg["save"], source_name=source_name,
+                            shape_scale=cfg.get("shape", SHAPING_SCALE))
     raise ValueError(f"Unknown controller kind: {kind!r}")
 
 
@@ -482,11 +557,27 @@ class Paddle:
 
     def move(self, direction):
         self.y += direction * PADDLE_SPEED
-        self.y = max(0, min(WINDOW_HEIGHT - PADDLE_HEIGHT, self.y))
+        if WRAP_PADDLES:
+            self.y %= WINDOW_HEIGHT                # top of paddle wraps around
+        else:
+            self.y = max(0, min(WINDOW_HEIGHT - PADDLE_HEIGHT, self.y))
 
     @property
-    def rect(self):
-        return pygame.Rect(int(self.x), int(self.y), PADDLE_WIDTH, PADDLE_HEIGHT)
+    def center(self):
+        return self.y + PADDLE_HEIGHT / 2
+
+    def rects(self):
+        """One rect normally; two when a wrapped paddle straddles the top/bottom
+        edge (the part that runs off the bottom reappears at the top)."""
+        y = self.y
+        if WRAP_PADDLES and y + PADDLE_HEIGHT > WINDOW_HEIGHT:
+            h1 = WINDOW_HEIGHT - y
+            return [pygame.Rect(int(self.x), int(y), PADDLE_WIDTH, int(h1)),
+                    pygame.Rect(int(self.x), 0, PADDLE_WIDTH, int(PADDLE_HEIGHT - h1))]
+        return [pygame.Rect(int(self.x), int(y), PADDLE_WIDTH, PADDLE_HEIGHT)]
+
+    def collides(self, ball):
+        return any(ball.rect.colliderect(r) for r in self.rects())
 
 
 class SideStats:
@@ -505,6 +596,49 @@ class SideStats:
         self.history.append(self.accuracy())
         self.hits = 0
         self.misses = 0
+
+
+def frozen_score(brain, side, frames=CHECKPOINT_FRAMES):
+    """Benchmark a brain's TRUE skill: play it frozen (no learning) on `side`
+    against the Perfect bot and return its hit rate. A fixed, opponent-agnostic
+    yardstick used by keep-the-best checkpointing."""
+    opp_side = "right" if side == "left" else "left"
+    paddles = {side: Paddle(side), opp_side: Paddle(opp_side)}
+    perfect = PerfectController(opp_side)
+    ai_pad = paddles[side]
+    ball = Ball()
+    hits = misses = 0
+    for _ in range(frames):
+        x = encode_state(ball, ai_pad.y, side)
+        ai_pad.move(brain.act(x, sample=True, remember=False) - 1)
+        paddles[opp_side].move(perfect.decide(ball, paddles[opp_side]))
+        ball.x += ball.dx
+        ball.y += ball.dy
+        if ball.y <= 0:
+            ball.dy = abs(ball.dy)
+        elif ball.y >= WINDOW_HEIGHT - BALL_SIZE:
+            ball.dy = -abs(ball.dy)
+        if ball.dx < 0 and paddles["left"].collides(ball):
+            ball.x = paddles["left"].x + PADDLE_WIDTH
+            ball.dx = abs(ball.dx)
+            _speed_up(ball)
+            if side == "left":
+                hits += 1
+        elif ball.dx > 0 and paddles["right"].collides(ball):
+            ball.x = paddles["right"].x - BALL_SIZE
+            ball.dx = -abs(ball.dx)
+            _speed_up(ball)
+            if side == "right":
+                hits += 1
+        if ball.x < -BALL_SIZE:
+            if side == "left":
+                misses += 1
+            ball.reset(serve_to="left")
+        elif ball.x > WINDOW_WIDTH:
+            if side == "right":
+                misses += 1
+            ball.reset(serve_to="right")
+    return hits / (hits + misses) if (hits + misses) else 0.0
 
 
 # ===========================================================================
@@ -554,7 +688,8 @@ def default_menu_config():
             kind, learning = "AI", True
         brain = path_const if (kind_const == "AI_Model" and os.path.exists(path_const)) else None
         save = path_const if path_const else f"brain_{side}.pkl"
-        return {"kind": kind, "brain": brain, "learning": learning, "save": save}
+        return {"kind": kind, "brain": brain, "learning": learning, "save": save,
+                "shape": SHAPING_SCALE}
     return {"left": one("left", LEFT_CONTROLLER, LEFT_MODEL_PATH),
             "right": one("right", RIGHT_CONTROLLER, RIGHT_MODEL_PATH)}
 
@@ -634,6 +769,22 @@ def run_menu(screen, clock, font, big_font, config):
                             color=(40, 120, 70) if on else (120, 50, 50))
                 regions.append((r, lambda s=side: config[s].update(learning=not config[s]["learning"])))
 
+                # --- training-wheels (shaping) strength ---
+                screen.blit(font.render("Training wheels:", True, GREY), (x0 + 170, 300))
+                rminus = _button(screen, font, "-", (x0 + 170, 326, 34, 34))
+                vbox = pygame.Rect(x0 + 208, 326, 90, 34)
+                pygame.draw.rect(screen, (30, 30, 42), vbox, border_radius=6)
+                pygame.draw.rect(screen, GREY, vbox, 1, border_radius=6)
+                sval = cfg.get("shape", SHAPING_SCALE)
+                vtxt = font.render(f"{sval:.2f}", True, WHITE)
+                screen.blit(vtxt, (vbox.x + (vbox.w - vtxt.get_width()) // 2, vbox.y + 7))
+                rplus = _button(screen, font, "+", (x0 + 302, 326, 34, 34))
+
+                def adj(side, d):
+                    config[side]["shape"] = round(min(0.6, max(0.0, config[side]["shape"] + d)), 2)
+                regions.append((rminus, lambda s=side: adj(s, -SHAPING_STEP)))
+                regions.append((rplus, lambda s=side: adj(s, +SHAPING_STEP)))
+
                 # --- save-as field ---
                 screen.blit(font.render("Save as:", True, GREY), (x0, 380))
                 fld = pygame.Rect(x0, 406, 450, 34)
@@ -695,6 +846,7 @@ def run_game(screen, clock, font, big_font, config):
     stats = {"left": SideStats(), "right": SideStats()}
     generation = 1
     resets_this_gen = 0
+    frame = 0
 
     def handle_miss(conceding_side, conceding_ctrl):
         nonlocal generation, resets_this_gen
@@ -719,18 +871,35 @@ def run_game(screen, clock, font, big_font, config):
         saved = False
         for ctrl in (left_ctrl, right_ctrl):
             if isinstance(ctrl, AIController):
-                ctrl.brain.save(ctrl.save_path)
-                print(f"Saved {ctrl.side} brain to {ctrl.save_path} "
-                      f"(gen {generation}, acc {stats[ctrl.side].accuracy():.2f})")
+                ctrl.brain_to_save().save(ctrl.save_path)
+                note = (f"best frozen {ctrl.best_score:.2f}"
+                        if (KEEP_BEST and ctrl.best_brain is not None)
+                        else f"acc {stats[ctrl.side].accuracy():.2f}")
+                print(f"Saved {ctrl.side} brain to {ctrl.save_path} (gen {generation}, {note})")
                 saved = True
         if not saved:
             print("No AI side active — nothing to save.")
+
+    def restore_best():
+        for ctrl in (left_ctrl, right_ctrl):
+            if isinstance(ctrl, AIController) and ctrl.restore_best():
+                print(f"{ctrl.side} brain restored to best (frozen {ctrl.best_score:.2f})")
 
     def toggle_learning(side):
         ctrl = left_ctrl if side == "left" else right_ctrl
         if isinstance(ctrl, AIController):
             ctrl.set_learning(not ctrl.learning)
             print(f"{side} learning -> {'ON' if ctrl.learning else 'OFF'}")
+
+    def adjust_wheels(delta):
+        # fade the training wheels on every AI side at once
+        changed = []
+        for ctrl in (left_ctrl, right_ctrl):
+            if isinstance(ctrl, AIController):
+                ctrl.adjust_shape(delta)
+                changed.append(f"{ctrl.side}={ctrl.shape_scale:.2f}")
+        if changed:
+            print("training wheels -> " + "  ".join(changed))
 
     while True:
         for event in pygame.event.get():
@@ -747,6 +916,19 @@ def run_game(screen, clock, font, big_font, config):
                     toggle_learning("left")
                 elif event.key == pygame.K_2:
                     toggle_learning("right")
+                elif event.key == pygame.K_MINUS:
+                    adjust_wheels(-SHAPING_STEP)
+                elif event.key in (pygame.K_EQUALS, pygame.K_PLUS):
+                    adjust_wheels(+SHAPING_STEP)
+                elif event.key == pygame.K_r:
+                    restore_best()
+
+        # keep-the-best: periodically score true frozen skill and snapshot peaks
+        frame += 1
+        if KEEP_BEST and frame % CHECKPOINT_EVERY == 0:
+            for ctrl in (left_ctrl, right_ctrl):
+                if isinstance(ctrl, AIController) and ctrl.learning:
+                    ctrl.checkpoint()
 
         left_paddle.move(left_ctrl.decide(ball, left_paddle))
         right_paddle.move(right_ctrl.decide(ball, right_paddle))
@@ -761,16 +943,16 @@ def run_game(screen, clock, font, big_font, config):
             ball.y = WINDOW_HEIGHT - BALL_SIZE
             ball.dy = -abs(ball.dy)
 
-        if ball.dx < 0 and ball.rect.colliderect(left_paddle.rect):
-            ball.x = left_paddle.rect.right
+        if ball.dx < 0 and left_paddle.collides(ball):
+            ball.x = left_paddle.x + PADDLE_WIDTH
             ball.dx = abs(ball.dx)
             _apply_spin(ball, left_paddle)
             _speed_up(ball)
             stats["left"].hits += 1
             if hasattr(left_ctrl, "on_hit"):
                 left_ctrl.on_hit()
-        elif ball.dx > 0 and ball.rect.colliderect(right_paddle.rect):
-            ball.x = right_paddle.rect.left - BALL_SIZE
+        elif ball.dx > 0 and right_paddle.collides(ball):
+            ball.x = right_paddle.x - BALL_SIZE
             ball.dx = -abs(ball.dx)
             _apply_spin(ball, right_paddle)
             _speed_up(ball)
@@ -790,9 +972,21 @@ def run_game(screen, clock, font, big_font, config):
         clock.tick(FPS)
 
 
+def _wrapped_dy(target, center):
+    """Vertical (target - center) taking the shorter way around when paddles
+    wrap. Returns the ordinary difference when wrapping is off."""
+    d = target - center
+    if WRAP_PADDLES:
+        if d > WINDOW_HEIGHT / 2:
+            d -= WINDOW_HEIGHT
+        elif d < -WINDOW_HEIGHT / 2:
+            d += WINDOW_HEIGHT
+    return d
+
+
 def _apply_spin(ball, paddle):
     """Add a little vertical influence based on where the ball struck the paddle."""
-    offset = (ball.y + BALL_SIZE / 2) - (paddle.y + PADDLE_HEIGHT / 2)
+    offset = _wrapped_dy(ball.y + BALL_SIZE / 2, paddle.center)
     ball.dy += (offset / (PADDLE_HEIGHT / 2)) * 1.5
 
 
@@ -812,8 +1006,10 @@ def _draw(screen, font, big_font, ball, lp, rp, lc, rc, stats, generation, reset
     for y in range(0, WINDOW_HEIGHT, 30):
         pygame.draw.rect(screen, GREY, (WINDOW_WIDTH // 2 - 2, y, 4, 18))
 
-    pygame.draw.rect(screen, BLUE, lp.rect)
-    pygame.draw.rect(screen, GREEN, rp.rect)
+    for r in lp.rects():
+        pygame.draw.rect(screen, BLUE, r)
+    for r in rp.rects():
+        pygame.draw.rect(screen, GREEN, r)
     pygame.draw.ellipse(screen, WHITE, ball.rect)
 
     # HUD
@@ -824,6 +1020,10 @@ def _draw(screen, font, big_font, ball, lp, rp, lc, rc, stats, generation, reset
     def label(side, ctrl):
         if isinstance(ctrl, AIController):
             tag = f"AI {'⚡learning' if ctrl.learning else 'frozen'}"
+            if ctrl.learning:
+                tag += f" wheels {ctrl.shape_scale:.2f}"
+            if ctrl.best_brain is not None:
+                tag += f" best {ctrl.best_score:.2f}"
         else:
             tag = ctrl.kind
         s = stats[side]
@@ -833,7 +1033,7 @@ def _draw(screen, font, big_font, ball, lp, rp, lc, rc, stats, generation, reset
     screen.blit(font.render(label("left", lc), True, BLUE), (20, WINDOW_HEIGHT - 56))
     screen.blit(font.render(label("right", rc), True, GREEN), (20, WINDOW_HEIGHT - 30))
 
-    hint = font.render("1/2:learn  S:save  M:menu  Esc:quit", True, GREY)
+    hint = font.render("1/2:learn  -/+:wheels  R:restore-best  S:save  M:menu  Esc:quit", True, GREY)
     screen.blit(hint, (WINDOW_WIDTH - hint.get_width() - 20, WINDOW_HEIGHT - 30))
 
 
