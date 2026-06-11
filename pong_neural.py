@@ -97,6 +97,15 @@ PADDLE_SPEED = 6
 # rescue it either). Left as an opt-in gameplay toggle but defaulted OFF.
 WRAP_PADDLES = False
 
+# Each paddle slightly wobbles its tilt (a small random walk) and deflects the
+# ball off the angled face when it hits, for a bit of unpredictability. The
+# amplitude (PADDLE_ANGLE_MAX) is set by a slider on the setup menu; the per-frame
+# wander step is a fixed fraction of it. 0 = no wobble.
+PADDLE_WOBBLE = True
+PADDLE_ANGLE_MAX = 0.1      # max tilt amplitude, radians (~13 deg); slider-controlled
+PADDLE_ANGLE_RANGE = 0.01     # slider's upper limit (~34 deg)
+PADDLE_WANDER_FRAC = 0.01    # per-frame random-walk step as a fraction of the amplitude
+
 BALL_SIZE = 10
 BALL_BASE_SPEED = 5.0
 BALL_SPEEDUP = 1.05          # multiplier applied to speed on every paddle hit
@@ -158,16 +167,19 @@ GRID = (42, 42, 58)
 # ===========================================================================
 
 class NeuralBrain:
-    """5 -> 8 -> 3 feed-forward policy network.
+    """5 -> N_HIDDEN -> 3 feed-forward policy network.
 
     Inputs (all normalized to ~[0,1], from the RIGHT-defender perspective):
         ball_x, ball_y, ball_dx, ball_dy, paddle_y
     Outputs (softmax over 3 actions):
         0 = move up, 1 = stay, 2 = move down
+
+    Note: brains saved with a different N_HIDDEN still load fine — load() adopts
+    whatever weight shapes are in the file; N_HIDDEN only sizes *fresh* brains.
     """
 
     N_INPUTS = 5
-    N_HIDDEN = 8
+    N_HIDDEN = 24            # hidden-layer neurons (was 8); bump for more capacity
     N_OUTPUTS = 3
 
     def __init__(self):
@@ -554,6 +566,7 @@ class Paddle:
         self.side = side
         self.x = 20 if side == "left" else WINDOW_WIDTH - 20 - PADDLE_WIDTH
         self.y = (WINDOW_HEIGHT - PADDLE_HEIGHT) / 2
+        self.angle = 0.0                          # current tilt, radians
 
     def move(self, direction):
         self.y += direction * PADDLE_SPEED
@@ -561,6 +574,24 @@ class Paddle:
             self.y %= WINDOW_HEIGHT                # top of paddle wraps around
         else:
             self.y = max(0, min(WINDOW_HEIGHT - PADDLE_HEIGHT, self.y))
+        if PADDLE_WOBBLE and PADDLE_ANGLE_MAX > 0:
+            step = PADDLE_ANGLE_MAX * PADDLE_WANDER_FRAC
+            self.angle += random.uniform(-step, step)
+            self.angle = max(-PADDLE_ANGLE_MAX, min(PADDLE_ANGLE_MAX, self.angle))
+        else:
+            self.angle = 0.0
+
+    def draw(self, screen, color):
+        # Cosmetic rotation; collision still uses the axis-aligned rects().
+        if not PADDLE_WOBBLE or abs(self.angle) < 1e-3 or \
+                (WRAP_PADDLES and self.y + PADDLE_HEIGHT > WINDOW_HEIGHT):
+            for r in self.rects():
+                pygame.draw.rect(screen, color, r)
+            return
+        surf = pygame.Surface((PADDLE_WIDTH, PADDLE_HEIGHT), pygame.SRCALPHA)
+        surf.fill(color)
+        rot = pygame.transform.rotate(surf, np.degrees(self.angle))
+        screen.blit(rot, rot.get_rect(center=(int(self.x + PADDLE_WIDTH / 2), int(self.center))))
 
     @property
     def center(self):
@@ -691,7 +722,8 @@ def default_menu_config():
         return {"kind": kind, "brain": brain, "learning": learning, "save": save,
                 "shape": SHAPING_SCALE}
     return {"left": one("left", LEFT_CONTROLLER, LEFT_MODEL_PATH),
-            "right": one("right", RIGHT_CONTROLLER, RIGHT_MODEL_PATH)}
+            "right": one("right", RIGHT_CONTROLLER, RIGHT_MODEL_PATH),
+            "wobble": PADDLE_ANGLE_MAX}
 
 
 def _button(screen, font, text, rect, active=False, enabled=True, color=None):
@@ -719,6 +751,9 @@ def run_menu(screen, clock, font, big_font, config):
 
     bidx = {"left": brain_index("left"), "right": brain_index("right")}
     editing = {"side": None}                     # which save-name field has focus
+    drag = {"on": False}                         # dragging the wobble slider?
+    slider_track = None
+    config.setdefault("wobble", PADDLE_ANGLE_MAX)
 
     while True:
         regions = []                             # (rect, callback) for mouse hits
@@ -796,13 +831,24 @@ def run_menu(screen, clock, font, big_font, config):
                 screen.blit(font.render(cfg["save"] + caret, True, WHITE), (fld.x + 10, fld.y + 7))
                 regions.append((fld, lambda s=side: editing.update(side=s)))
 
+        # --- paddle-wobble slider (global) ---
+        cx = screen.get_width() // 2
+        wob = config["wobble"]
+        screen.blit(font.render(f"Paddle wobble (random angle): {int(round(np.degrees(wob)))} deg",
+                                True, GREY), (cx - 150, 440))
+        slider_track = pygame.Rect(cx - 150, 472, 300, 6)
+        pygame.draw.rect(screen, (30, 30, 42), slider_track, border_radius=3)
+        pygame.draw.rect(screen, GREY, slider_track, 1, border_radius=3)
+        frac = wob / PADDLE_ANGLE_RANGE if PADDLE_ANGLE_RANGE else 0.0
+        hx = int(slider_track.x + frac * slider_track.width)
+        pygame.draw.rect(screen, BLUE, pygame.Rect(hx - 7, slider_track.y - 9, 14, 24), border_radius=4)
+
         # --- start + hint ---
-        start = _button(screen, big_font, "START  ▶", (screen.get_width() // 2 - 110, 500, 220, 48),
-                        color=(40, 120, 70))
+        start = _button(screen, big_font, "START  ▶", (cx - 110, 506, 220, 44), color=(40, 120, 70))
         regions.append((start, lambda: "start"))
-        hint = font.render("Click to configure each side.  In game: 1/2 toggle learning · "
-                           "S save · M menu · Esc quit", True, GREY)
-        screen.blit(hint, (screen.get_width() // 2 - hint.get_width() // 2, 560))
+        hint = font.render("Configure each side · drag the wobble slider.  "
+                           "In game: 1/2 learn · -/+ wheels · R restore · S save · M menu", True, GREY)
+        screen.blit(hint, (cx - hint.get_width() // 2, 562))
 
         pygame.display.flip()
         clock.tick(FPS)
@@ -813,11 +859,21 @@ def run_menu(screen, clock, font, big_font, config):
                 return None
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 editing["side"] = None
-                for rect, cb in regions:
-                    if rect.collidepoint(event.pos):
-                        if cb() == "start":
-                            return config
-                        break
+                if slider_track and slider_track.inflate(24, 28).collidepoint(event.pos):
+                    drag["on"] = True
+                    frac = max(0.0, min(1.0, (event.pos[0] - slider_track.x) / slider_track.width))
+                    config["wobble"] = round(frac * PADDLE_ANGLE_RANGE, 3)
+                else:
+                    for rect, cb in regions:
+                        if rect.collidepoint(event.pos):
+                            if cb() == "start":
+                                return config
+                            break
+            elif event.type == pygame.MOUSEMOTION and drag["on"]:
+                frac = max(0.0, min(1.0, (event.pos[0] - slider_track.x) / slider_track.width))
+                config["wobble"] = round(frac * PADDLE_ANGLE_RANGE, 3)
+            elif event.type == pygame.MOUSEBUTTONUP:
+                drag["on"] = False
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     return None
@@ -836,6 +892,9 @@ def run_menu(screen, clock, font, big_font, config):
 def run_game(screen, clock, font, big_font, config):
     """Run one match. Returns (result, stats, (left_ctrl, right_ctrl)) where
     result is "menu" (return to setup) or "quit" (exit the program)."""
+    global PADDLE_ANGLE_MAX
+    PADDLE_ANGLE_MAX = config.get("wobble", PADDLE_ANGLE_MAX)   # apply the menu slider
+
     left_ctrl = build_from_config("left", config["left"])
     right_ctrl = build_from_config("right", config["right"])
 
@@ -947,6 +1006,7 @@ def run_game(screen, clock, font, big_font, config):
             ball.x = left_paddle.x + PADDLE_WIDTH
             ball.dx = abs(ball.dx)
             _apply_spin(ball, left_paddle)
+            _apply_angle(ball, left_paddle, "left")
             _speed_up(ball)
             stats["left"].hits += 1
             if hasattr(left_ctrl, "on_hit"):
@@ -955,6 +1015,7 @@ def run_game(screen, clock, font, big_font, config):
             ball.x = right_paddle.x - BALL_SIZE
             ball.dx = -abs(ball.dx)
             _apply_spin(ball, right_paddle)
+            _apply_angle(ball, right_paddle, "right")
             _speed_up(ball)
             stats["right"].hits += 1
             if hasattr(right_ctrl, "on_hit"):
@@ -990,6 +1051,21 @@ def _apply_spin(ball, paddle):
     ball.dy += (offset / (PADDLE_HEIGHT / 2)) * 1.5
 
 
+def _apply_angle(ball, paddle, side):
+    """Deflect the ball off the paddle's tilted face, then renormalize so speed
+    is preserved and the ball still travels away from the paddle."""
+    if not PADDLE_WOBBLE or paddle.angle == 0.0:
+        return
+    speed = ball.speed()
+    sign = 1.0 if side == "left" else -1.0
+    ball.dy += sign * np.sin(2 * paddle.angle) * speed * 0.6
+    sp = ball.speed()
+    if sp > 0:
+        f = speed / sp
+        ball.dx *= f
+        ball.dy *= f
+
+
 def _speed_up(ball):
     speed = ball.speed()
     target = min(speed * BALL_SPEEDUP, BALL_MAX_SPEED)
@@ -1006,10 +1082,8 @@ def _draw(screen, font, big_font, ball, lp, rp, lc, rc, stats, generation, reset
     for y in range(0, WINDOW_HEIGHT, 30):
         pygame.draw.rect(screen, GREY, (WINDOW_WIDTH // 2 - 2, y, 4, 18))
 
-    for r in lp.rects():
-        pygame.draw.rect(screen, BLUE, r)
-    for r in rp.rects():
-        pygame.draw.rect(screen, GREEN, r)
+    lp.draw(screen, BLUE)
+    rp.draw(screen, GREEN)
     pygame.draw.ellipse(screen, WHITE, ball.rect)
 
     # HUD
@@ -1030,11 +1104,11 @@ def _draw(screen, font, big_font, ball, lp, rp, lc, rc, stats, generation, reset
         return (f"{side.upper()} [{tag}]  hits {s.hits}  miss {s.misses}"
                 f"  acc {s.accuracy():.2f}")
 
-    screen.blit(font.render(label("left", lc), True, BLUE), (20, WINDOW_HEIGHT - 56))
-    screen.blit(font.render(label("right", rc), True, GREEN), (20, WINDOW_HEIGHT - 30))
+    screen.blit(font.render(label("left", lc), True, BLUE), (20, WINDOW_HEIGHT - 74))
+    screen.blit(font.render(label("right", rc), True, GREEN), (20, WINDOW_HEIGHT - 52))
 
     hint = font.render("1/2:learn  -/+:wheels  R:restore-best  S:save  M:menu  Esc:quit", True, GREY)
-    screen.blit(hint, (WINDOW_WIDTH - hint.get_width() - 20, WINDOW_HEIGHT - 30))
+    screen.blit(hint, (20, WINDOW_HEIGHT - 26))      # own line, below the stats
 
 
 def _draw_graph(screen, font, stats, controllers, generation):
